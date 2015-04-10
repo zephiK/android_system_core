@@ -48,6 +48,8 @@
 
 #include <private/android_filesystem_config.h>
 
+#define chmod DO_NOT_USE_CHMOD_USE_FCHMODAT_SYMLINK_NOFOLLOW
+
 int add_environment(const char *name, const char *value);
 
 extern int init_module(void *, unsigned long, const char *);
@@ -73,63 +75,6 @@ static int write_file(const char *path, const char *value)
     } else {
         return 0;
     }
-}
-
-static int _open(const char *path)
-{
-    int fd;
-
-    fd = open(path, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0)
-        fd = open(path, O_WRONLY | O_NOFOLLOW);
-
-    return fd;
-}
-
-static int _chown(const char *path, unsigned int uid, unsigned int gid)
-{
-    int fd;
-    int ret;
-
-    fd = _open(path);
-    if (fd < 0) {
-        return -1;
-    }
-
-    ret = fchown(fd, uid, gid);
-    if (ret < 0) {
-        int errno_copy = errno;
-        close(fd);
-        errno = errno_copy;
-        return -1;
-    }
-
-    close(fd);
-
-    return 0;
-}
-
-static int _chmod(const char *path, mode_t mode)
-{
-    int fd;
-    int ret;
-
-    fd = _open(path);
-    if (fd < 0) {
-        return -1;
-    }
-
-    ret = fchmod(fd, mode);
-    if (ret < 0) {
-        int errno_copy = errno;
-        close(fd);
-        errno = errno_copy;
-        return -1;
-    }
-
-    close(fd);
-
-    return 0;
 }
 
 static int insmod(const char *filename, char *options)
@@ -259,6 +204,68 @@ int do_exec(int nargs, char **args)
     return -1;
 }
 
+int do_execonce(int nargs, char **args)
+{
+    pid_t child;
+    int child_status = 0;
+    static int already_done;
+
+    if (already_done) {
+      return -1;
+    }
+    already_done = 1;
+    if (!(child = fork())) {
+        /*
+         * Child process.
+         */
+        zap_stdio();
+        char *exec_args[100];
+        int i;
+        int num_process_args = nargs;
+
+        memset(exec_args, 0, sizeof(exec_args));
+        if (num_process_args > ARRAY_SIZE(exec_args) - 1) {
+            ERROR("exec called with %d args, limit is %d", num_process_args,
+                  ARRAY_SIZE(exec_args) - 1);
+            _exit(1);
+        }
+        for (i = 1; i < num_process_args; i++)
+            exec_args[i - 1] = args[i];
+
+        if (execv(exec_args[0], exec_args) == -1) {
+            ERROR("Failed to execv '%s' (%s)", exec_args[0], strerror(errno));
+            _exit(1);
+        }
+        ERROR("Returned from execv()!");
+        _exit(1);
+    }
+
+    /*
+     * Parent process.
+     */
+    if (child == -1) {
+        ERROR("Fork failed\n");
+        return -1;
+    }
+
+    if (TEMP_FAILURE_RETRY(waitpid(child, &child_status, 0)) == -1) {
+        ERROR("waitpid(): failed (%s)\n", strerror(errno));
+        return -1;
+    }
+
+    if (WIFSIGNALED(child_status)) {
+        INFO("Child exited due to signal %d\n", WTERMSIG(child_status));
+        return -1;
+    } else if (WIFEXITED(child_status)) {
+        INFO("Child exited normally (exit code %d)\n", WEXITSTATUS(child_status));
+        return WEXITSTATUS(child_status);
+    }
+
+    ERROR("Abnormal child process exit\n");
+
+    return -1;
+}
+
 int do_export(int nargs, char **args)
 {
     return add_environment(args[1], args[2]);
@@ -319,7 +326,7 @@ int do_mkdir(int nargs, char **args)
     ret = make_dir(args[1], mode);
     /* chmod in case the directory already exists */
     if (ret == -1 && errno == EEXIST) {
-        ret = _chmod(args[1], mode);
+        ret = fchmodat(AT_FDCWD, args[1], mode, AT_SYMLINK_NOFOLLOW);
     }
     if (ret == -1) {
         return -errno;
@@ -333,13 +340,13 @@ int do_mkdir(int nargs, char **args)
             gid = decode_uid(args[4]);
         }
 
-        if (_chown(args[1], uid, gid) < 0) {
+        if (lchown(args[1], uid, gid) == -1) {
             return -errno;
         }
 
         /* chown may have cleared S_ISUID and S_ISGID, chmod again */
         if (mode & (S_ISUID | S_ISGID)) {
-            ret = _chmod(args[1], mode);
+            ret = fchmodat(AT_FDCWD, args[1], mode, AT_SYMLINK_NOFOLLOW);
             if (ret == -1) {
                 return -errno;
             }
@@ -813,10 +820,10 @@ out:
 int do_chown(int nargs, char **args) {
     /* GID is optional. */
     if (nargs == 3) {
-        if (_chown(args[2], decode_uid(args[1]), -1) < 0)
+        if (lchown(args[2], decode_uid(args[1]), -1) == -1)
             return -errno;
     } else if (nargs == 4) {
-        if (_chown(args[3], decode_uid(args[1]), decode_uid(args[2])) < 0)
+        if (lchown(args[3], decode_uid(args[1]), decode_uid(args[2])) == -1)
             return -errno;
     } else {
         return -1;
@@ -839,7 +846,7 @@ static mode_t get_mode(const char *s) {
 
 int do_chmod(int nargs, char **args) {
     mode_t mode = get_mode(args[1]);
-    if (_chmod(args[2], mode) < 0) {
+    if (fchmodat(AT_FDCWD, args[2], mode, AT_SYMLINK_NOFOLLOW) < 0) {
         return -errno;
     }
     return 0;
